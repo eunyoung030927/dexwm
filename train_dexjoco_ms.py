@@ -350,6 +350,11 @@ def main() -> int:
                            "step": step, "epoch": epoch, "val_loss": value,
                            "baseline_val_loss": baseline}
                 torch.save(payload, args.out / "last.pth.tar")
+                if not (args.out / "best.pth.tar").exists():
+                    # a curriculum phase resumes from the previous phase's
+                    # best.pth.tar, so that file has to exist even if this phase
+                    # never beats the checkpoint it started from
+                    torch.save(payload, args.out / "best.pth.tar")
                 if value < best:
                     best = value
                     torch.save(payload, args.out / "best.pth.tar")
