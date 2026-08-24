@@ -79,12 +79,20 @@ class DexJoCoDemoDataset(Dataset):
         train: train split (True) or held-out validation episodes (False).
         val_every: every val_every-th episode (by index) is held out.
         windows_per_episode: windows drawn per episode per epoch.
+        n_future: number of future frames after the `num_context` context
+            frames.  ``1`` (default) is the single-step window this class was
+            written for; ``N > 1`` returns ``num_context + N`` frames and
+            ``num_context - 1 + N`` consecutive deltas, which is what the
+            multistep (autoregressive rollout) trainer needs.  The last ``N``
+            deltas are the ones that drive the rollout; the leading
+            ``num_context - 1`` are the context transitions.
     """
 
     def __init__(self, root_folder, world_to_camera, max_context_len=40,
                  num_context=8, patch_size=14, img_size=224, train=True,
                  val_every=10, windows_per_episode=40, seed=0, aug=None,
-                 backbone_name="dinov2", context_stride=CONTEXT_STRIDE, **_ignored):
+                 backbone_name="dinov2", context_stride=CONTEXT_STRIDE,
+                 n_future=1, **_ignored):
         super().__init__()
         self.root = Path(root_folder)
         manifest = json.loads((self.root / "manifest.json").read_text())
@@ -95,8 +103,14 @@ class DexJoCoDemoDataset(Dataset):
         self.lengths = {entry["episode"]: entry["length"]
                         for entry in manifest["episodes"]}
         self.num_context = num_context
+        self.n_future = int(n_future)
+        if self.n_future < 1:
+            raise ValueError("n_future must be >= 1")
         self.context_stride = context_stride
-        self.span = num_context * context_stride
+        # frames per window = num_context + n_future, so the window spans
+        # (num_context - 1 + n_future) strides.  n_future = 1 reproduces the
+        # original num_context * context_stride span exactly.
+        self.span = (num_context - 1 + self.n_future) * context_stride
         self.patch_size = patch_size
         self.img_size = img_size
         self.train = train
@@ -131,7 +145,7 @@ class DexJoCoDemoDataset(Dataset):
         slot = index % self.windows_per_episode
         start = self._start(episode, slot)
         indices = [start + k * self.context_stride
-                   for k in range(self.num_context + 1)]
+                   for k in range(self.num_context + self.n_future)]
 
         with np.load(self.root / f"episode_{episode:03d}.npz",
                      allow_pickle=False) as store:
@@ -151,6 +165,7 @@ class DexJoCoDemoDataset(Dataset):
         actions = self._deltas(absolute, world_to_camera=self.world_to_camera)
 
         curr_frames = torch.stack(frames)
-        rel_t = np.full(self.num_context, self.context_stride, dtype=np.int64)
+        rel_t = np.full(self.num_context - 1 + self.n_future,
+                        self.context_stride, dtype=np.int64)
         metadata = {"episode": episode, "start": start}
         return curr_frames, actions, rel_t, 0, 0, metadata
