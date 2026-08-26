@@ -117,6 +117,28 @@ def retarget_kp_head(model, channels: int) -> None:
     decoder.output_channels = channels
 
 
+def freeze_backbone(model, keep_last: int) -> None:
+    """Forgetting control: train only the top of the predictor plus the head.
+
+    If the keypoint-supervised run fails, the honest question is whether the
+    fine-tune OVERWROTE the pre-trained interaction knowledge or whether that
+    knowledge was never there.  Freezing everything below the last `keep_last`
+    CDiT blocks (the final layer, the keypoint head and those blocks stay
+    trainable) answers it: the frozen variant cannot forget.
+    """
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    for block in model.blocks[-keep_last:]:
+        for parameter in block.parameters():
+            parameter.requires_grad_(True)
+    for module in (model.final_layer, model.kp_layer):
+        for parameter in module.parameters():
+            parameter.requires_grad_(True)
+    model.pos_embed.requires_grad_(True)
+    for parameter in model.image_embedder.parameters():
+        parameter.requires_grad_(False)
+
+
 def kp_forward_last(model):
     """`DexWM.forward_kp` restricted to the newest predicted frame.
 
@@ -311,6 +333,10 @@ def main() -> int:
                              "included) uses --lr")
     parser.add_argument("--best-metric", choices=["total", "emb"], default="total",
                         help="which validation number selects best.pth.tar")
+    parser.add_argument("--freeze-blocks", type=int, default=0,
+                        help="forgetting control: keep only the last N CDiT "
+                             "blocks (+ final layer + kp head + pos_embed) "
+                             "trainable; 0 trains the whole predictor")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--no-compile-attention", dest="compile_attention",
                         action="store_false")
@@ -345,6 +371,8 @@ def main() -> int:
         channels = val_set.kp_channels
         retarget_kp_head(model, len(channels))
         model.forward_kp = kp_forward_last(model)
+        if args.freeze_blocks:
+            freeze_backbone(model, args.freeze_blocks)
         for parameter in model.kp_layer.parameters():
             parameter.requires_grad_(True)
         head = list(model.kp_layer.vit_decoder.head[0].parameters())
@@ -355,7 +383,8 @@ def main() -> int:
                   {"params": head, "lr": args.kp_head_lr}]
         trainable = body + head
         print(f"[kp] channels {channels} weight {args.kp_weight} "
-              f"head_lr {args.kp_head_lr}", flush=True)
+              f"head_lr {args.kp_head_lr} freeze_blocks {args.freeze_blocks}",
+              flush=True)
     else:
         model.forward_kp = lambda *_a, **_k: (None, torch.zeros((), device=args.device))
         for parameter in model.kp_layer.parameters():
@@ -541,6 +570,7 @@ def main() -> int:
          "kp_weight": args.kp_weight if with_kp else None,
          "kp_head_lr": args.kp_head_lr if with_kp else None,
          "best_metric": args.best_metric,
+         "freeze_blocks": args.freeze_blocks,
          "baseline": baseline_record,
          "baseline_val_loss": baseline, "baseline_val_loss_per_step": baseline_steps,
          "best_val_loss": best, "steps": step, "total_steps": total_steps,
