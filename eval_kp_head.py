@@ -124,7 +124,6 @@ def evaluate_demos(model, loader, device, num_context, n_future, limit,
 
 
 # --------------------------------------------------------------- branch mode
-@torch.no_grad()
 def overlay(frame_bgr, heat, centre, radius, title):
     """Heatmap of one channel on the 392x224 crop, with the GT footprint."""
     import cv2
