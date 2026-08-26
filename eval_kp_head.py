@@ -168,7 +168,9 @@ def evaluate_branches(model, data_dir: Path, device, steps, horizon, channels,
             # projected footprint is approximated by the disc that covers the
             # projected bottom/top pair plus the projected radius
             live = data["gt_live_keypoints"]
-            dtype = torch.bfloat16 if device != "cpu" else torch.float32
+            # inputs stay float32 and autocast does the casting, exactly as in
+            # training (the rollout evaluator instead casts the whole model)
+            dtype = torch.float32
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 latent = model.encode_image(context[None].to(device, dtype))[0]
                 current = model.kp_layer(latent[-1:][None].float(),
