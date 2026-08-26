@@ -125,8 +125,29 @@ def evaluate_demos(model, loader, device, num_context, n_future, limit,
 
 # --------------------------------------------------------------- branch mode
 @torch.no_grad()
+def overlay(frame_bgr, heat, centre, radius, title):
+    """Heatmap of one channel on the 392x224 crop, with the GT footprint."""
+    import cv2
+    positive = np.clip(heat, 0.0, None)
+    scaled = positive / max(float(positive.max()), 1e-9)
+    colour = cv2.applyColorMap((scaled * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+    blended = cv2.addWeighted(frame_bgr, 0.55, colour, 0.45, 0)
+    cv2.circle(blended, (int(centre[0]), int(centre[1])), int(radius),
+               (255, 255, 255), 1)
+    peak = np.unravel_index(int(heat.argmax()), heat.shape)
+    cv2.drawMarker(blended, (int(peak[1]), int(peak[0])), (60, 255, 60),
+                   cv2.MARKER_CROSS, 12, 2)
+    cv2.putText(blended, title, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                (0, 0, 0), 3)
+    cv2.putText(blended, title, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                (255, 255, 255), 1)
+    return blended
+
+
+@torch.no_grad()
 def evaluate_branches(model, data_dir: Path, device, steps, horizon, channels,
-                      conditioning, radius_scale) -> dict:
+                      conditioning, radius_scale, figure_dir=None,
+                      figure_branches=3) -> dict:
     vls_root()
     from label_demo_keypoints import project, to_crop
     from score_branch_candidates import CONTEXT_LEN, WM_STEP, decode, preprocess
@@ -134,6 +155,7 @@ def evaluate_branches(model, data_dir: Path, device, steps, horizon, channels,
 
     object_channel = channels.index("object")
     rows = []
+    figure_branches_done = []
     for path in sorted(data_dir.glob("branch_*.npz")):
         with np.load(path, allow_pickle=False) as data:
             keys = sorted(key for key in data.files
@@ -213,6 +235,33 @@ def evaluate_branches(model, data_dir: Path, device, steps, horizon, channels,
             # measured once per branch point
             rows.append({"branch": path.stem, "candidate": -1, "when": "present",
                          **measure(current[object_channel], live[0, 0])})
+            if figure_dir is not None and len(figure_branches_done) < figure_branches:
+                import cv2
+                figure_branches_done.append(path.stem)
+                frame = decode(data[keys[-1]])
+                height, width = frame.shape[:2]
+                crop = min(height, int(round(width / (CROP_WIDTH / CROP_HEIGHT))))
+                top = (height - crop) // 2
+                base = cv2.cvtColor(
+                    cv2.resize(frame[top:top + crop], (CROP_WIDTH, CROP_HEIGHT)),
+                    cv2.COLOR_RGB2BGR)
+                tiles = []
+                centre, radius = footprint(np.stack([live[0, 0][3], live[0, 0][4]]))
+                for name in channels:
+                    tiles.append(overlay(base, current[channels.index(name)].numpy(),
+                                         centre, radius, f"present {name}"))
+                for index in (0, min(1, predicted.shape[0] - 1)):
+                    centre_h, radius_h = footprint(
+                        np.stack([live[index, horizon][3], live[index, horizon][4]]))
+                    tiles.append(overlay(
+                        base, predicted[index][object_channel].numpy(),
+                        centre_h, radius_h, f"h{horizon} cand{index} object"))
+                columns = 3
+                usable = len(tiles) - len(tiles) % columns
+                grid = np.vstack([np.hstack(tiles[i:i + columns])
+                                  for i in range(0, usable, columns)])
+                Path(figure_dir).mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(Path(figure_dir) / f"heat_{path.stem}.png"), grid)
             for index in range(predicted.shape[0]):
                 rows.append({"branch": path.stem, "candidate": index,
                              "when": f"h{horizon}",
@@ -259,6 +308,9 @@ def main() -> int:
     parser.add_argument("--horizon", type=int, default=30)
     parser.add_argument("--conditioning", default="cmd_rel")
     parser.add_argument("--radius-scale", type=float, default=1.0)
+    parser.add_argument("--figure-dir", type=Path,
+                        default=Path("/root/dexwm_branch/figs/kp"))
+    parser.add_argument("--figure-branches", type=int, default=3)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
@@ -286,7 +338,8 @@ def main() -> int:
     if args.mode in ("branch", "both"):
         payload["branch"] = evaluate_branches(
             model, args.data_dir, args.device, args.horizon // 5, args.horizon,
-            channels, args.conditioning, args.radius_scale)
+            channels, args.conditioning, args.radius_scale, args.figure_dir,
+            args.figure_branches)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(payload, indent=2))
