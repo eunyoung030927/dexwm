@@ -3,9 +3,16 @@
 # Mirrors datasets/robocasa_random_movement.RobocasaRandomDataset:
 #   * returns a (num_context + 1)-frame window sampled at a fixed stride,
 #   * returns (num_context, action_dim) keypoint deltas, one per transition,
-#   * returns rel_t, and placeholders for the heatmap keypoint auxiliary loss
-#     (DexJoCo demos carry no 2-D keypoint annotation, so the kp loss is
-#     disabled by the trainer instead of being fed zeros).
+#   * returns rel_t and, when `kp_root` is given, the belief maps + validity
+#     mask for the heatmap keypoint auxiliary loss.  The public DexJoCo demos
+#     carry no 2-D keypoint annotation (the LeRobot features are exactly
+#     observation.state and action - there is no object pose), so the labels are
+#     manufactured offline by `scripts/dexwm/label_demo_keypoints.py` in the VLS
+#     repo: Allegro FK for the hand, SAM3 text prompts for the object and the
+#     bucket, shaped like what core/keypoint_detector.py + keypoint_tracker.py
+#     produce at run time (graspable objects collapsed to their centre).  With
+#     `kp_root=None` the loader behaves exactly as before and the trainer
+#     disables the kp loss.
 #
 # The frames come from `scripts/dexwm/export_demo_frames.py` in the VLS repo,
 # which decodes the LeRobot episodes and re-encodes each 640x640 front frame
@@ -26,6 +33,8 @@ import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+from utils.image_utils import create_belief_map
 
 CONTEXT_STRIDE = 5   # control steps between DexWM frames, as in every VLS trace
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
@@ -92,7 +101,7 @@ class DexJoCoDemoDataset(Dataset):
                  num_context=8, patch_size=14, img_size=224, train=True,
                  val_every=10, windows_per_episode=40, seed=0, aug=None,
                  backbone_name="dinov2", context_stride=CONTEXT_STRIDE,
-                 n_future=1, **_ignored):
+                 n_future=1, kp_root=None, kp_sigma=2, **_ignored):
         super().__init__()
         self.root = Path(root_folder)
         manifest = json.loads((self.root / "manifest.json").read_text())
@@ -123,6 +132,29 @@ class DexJoCoDemoDataset(Dataset):
         # imported lazily so the module is importable without the VLS repo
         from core.dexwm_action_adapter import dexwm_action_deltas
         self._deltas = dexwm_action_deltas
+        self.kp_root = Path(kp_root) if kp_root else None
+        self.kp_sigma = kp_sigma
+        self.kp_channels = None
+        self.labels = {}
+        if self.kp_root is not None:
+            # labels exist only every `context_stride` control steps, so window
+            # starts are snapped to that grid (see `_start`); the arrays are a
+            # few hundred kB per episode and are kept in RAM.
+            for episode in self.episodes:
+                path = self.kp_root / f"episode_{episode:03d}.npz"
+                if not path.exists():
+                    continue
+                with np.load(path, allow_pickle=True) as store:
+                    if self.kp_channels is None:
+                        self.kp_channels = [str(name) for name in store["channels"]]
+                    self.labels[episode] = {
+                        "uv": store["uv_crop"].astype(np.float32),
+                        "valid": store["valid"].astype(np.float32),
+                        "frame_index": store["frame_index"].astype(np.int64),
+                    }
+            if not self.labels:
+                raise FileNotFoundError(f"no keypoint labels under {self.kp_root}")
+            self.episodes = [e for e in self.episodes if e in self.labels]
         self.usable = [e for e in self.episodes
                        if self.lengths[e] - 1 - self.span > 0]
         self.n_windows_total = sum(self.lengths[e] - self.span
@@ -137,8 +169,14 @@ class DexJoCoDemoDataset(Dataset):
         high = int(round((slot + 1) * last / self.windows_per_episode))
         high = max(high, low + 1)
         if self.train:
-            return int(np.random.randint(low, min(high, last + 1)))
-        return int(min((low + high) // 2, last))
+            start = int(np.random.randint(low, min(high, last + 1)))
+        else:
+            start = int(min((low + high) // 2, last))
+        if self.kp_root is not None:
+            # every frame of the window must carry a label, and labels live on
+            # the multiples of `context_stride`
+            start = min((start // self.context_stride) * self.context_stride, last)
+        return start
 
     def __getitem__(self, index):
         episode = self.usable[index // self.windows_per_episode]
@@ -168,4 +206,33 @@ class DexJoCoDemoDataset(Dataset):
         rel_t = np.full(self.num_context - 1 + self.n_future,
                         self.context_stride, dtype=np.int64)
         metadata = {"episode": episode, "start": start}
-        return curr_frames, actions, rel_t, 0, 0, metadata
+        if self.kp_root is None:
+            return curr_frames, actions, rel_t, 0, 0, metadata
+        heatmaps, valid_kp = self._belief_maps(episode, indices[self.num_context:])
+        return curr_frames, actions, rel_t, heatmaps, valid_kp, metadata
+
+    def _belief_maps(self, episode: int, frame_indices):
+        """(N, C, 224, 392) belief maps and (N, C) validity for the future frames.
+
+        `create_belief_map` is the upstream helper (utils/image_utils.py) used by
+        the EgoDex and RoboCasa loaders, at the same sigma, so the target this
+        head sees is the same object it was pre-trained on - only the channel
+        meaning changes.
+        """
+        label = self.labels[episode]
+        width = 392 if self.patch_size == 14 else 384
+        channels = len(self.kp_channels)
+        maps = np.zeros((len(frame_indices), channels, self.img_size, width),
+                        dtype=np.float32)
+        valid = np.zeros((len(frame_indices), channels), dtype=np.float32)
+        for slot, frame in enumerate(frame_indices):
+            position = frame // self.context_stride
+            if position >= label["frame_index"].shape[0] or \
+                    label["frame_index"][position] != frame:
+                continue
+            points = label["uv"][position]
+            valid[slot] = label["valid"][position]
+            maps[slot] = create_belief_map((width, self.img_size), points,
+                                           sigma=self.kp_sigma).astype(np.float32)
+        maps *= valid[:, :, None, None]
+        return torch.from_numpy(maps), torch.from_numpy(valid)
