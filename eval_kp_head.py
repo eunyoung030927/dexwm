@@ -155,6 +155,10 @@ def evaluate_branches(model, data_dir: Path, device, steps, horizon, channels,
     object_channel = channels.index("object")
     rows = []
     figure_branches_done = []
+    # the rollout only needs the latents; decoding a heatmap on every one of the
+    # 12 x 20 intermediate steps would be pure waste
+    kp_head = model.forward_kp
+    model.forward_kp = lambda *_a, **_k: (None, None)
     for path in sorted(data_dir.glob("branch_*.npz")):
         with np.load(path, allow_pickle=False) as data:
             keys = sorted(key for key in data.files
@@ -273,6 +277,7 @@ def evaluate_branches(model, data_dir: Path, device, steps, horizon, channels,
                              **measure(predicted[index][object_channel],
                                        live[index, 0])})
         print(f"{path.name}: can-firing checked", flush=True)
+    model.forward_kp = kp_head
 
     summary = {}
     for tag in sorted({row["when"] for row in rows}):

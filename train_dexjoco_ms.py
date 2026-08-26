@@ -95,26 +95,111 @@ def frozen_encoder(model, latents: torch.Tensor):
 HEATMAP_GRID = [16, 28]   # DINOv2 patch grid of the 392x224 crop
 
 
-def retarget_kp_head(model, channels: int) -> None:
+# The public checkpoint's 12 heatmap channels are, in order,
+# [left palm, left thumb, left index, left middle, left ring, left little,
+#  right palm, right thumb, right index, right middle, right ring, right little]
+# - RoboCasa zeroes the left half (`robocasa_random_movement.py:239-241`) and
+# builds the right half from MANO indices [0, 4, 8, 12, 16, 20] with the ring
+# finger duplicated as the absent little finger.  Five of our seven channels
+# therefore already exist in the pre-trained head.
+UPSTREAM_RIGHT_HAND = {"palm": 6, "thumb_tip": 7, "index_tip": 8,
+                       "middle_tip": 9, "ring_tip": 10, "little_tip": 11}
+CHANNEL_INHERITANCE = {
+    "index_tip": 8, "middle_tip": 9, "ring_tip": 10, "thumb_tip": 7,
+    "palm": 6,
+    # no pre-trained analogue: start both from the spare duplicated little
+    # finger, which already emits a sharp blob of the right dynamic range near
+    # the hand - which is where the grasped object is
+    "object": 11, "bucket": 11,
+}
+
+
+def retarget_kp_head(model, channel_names, verbose: bool = True) -> None:
     """Point the pre-trained heatmap head at OUR channel set.
 
-    Everything in `kp_layer` except the final patch projection is kept: the
-    upstream checkpoint's decoder already turns a DexWM latent into keypoint-
-    shaped features, only the 12 EgoDex/RoboCasa channels have to be replaced by
-    our 7.  The replacement is zero-initialised (as DiT does for its final
-    layer), so the auxiliary loss starts at the target's own energy instead of
-    injecting a large random gradient into the shared trunk on step 1.
+    Everything in `kp_layer` except the final patch projection is kept.  The
+    projection itself is not re-initialised from scratch: each of our channels
+    copies the rows of the pre-trained channel it corresponds to
+    (`CHANNEL_INHERITANCE`), so the head starts out already able to localise a
+    palm and four fingertips in this crop.
+
+    A zero-initialised head was tried first and DIVERGED: held-out kp loss went
+    from 1.43e-4 (the target's own energy, i.e. what predicting nothing scores)
+    to 2.82e-4 by step 150 while emb degraded 3.7%.  Learning a 256->14*14*C
+    spatial code from scratch in 1500 steps is not a thing that happens.
+
+    The head's output is laid out `(p1 p2 c)`, so channel `c` of a `C`-channel
+    head owns rows `c::C`.
     """
+    if isinstance(channel_names, int):
+        channel_names = [f"kp{i}" for i in range(channel_names)]
+    channels = len(channel_names)
     decoder = model.kp_layer.vit_decoder
     old = decoder.head[0]
-    new = torch.nn.Linear(old.in_features, decoder.patch_size ** 2 * channels,
+    patch = decoder.patch_size
+    old_channels = old.weight.shape[0] // (patch * patch)
+    new = torch.nn.Linear(old.in_features, patch * patch * channels,
                           bias=old.bias is not None,
                           device=old.weight.device, dtype=old.weight.dtype)
     torch.nn.init.zeros_(new.weight)
     if new.bias is not None:
         torch.nn.init.zeros_(new.bias)
+    with torch.no_grad():
+        source = old.weight.view(patch, patch, old_channels, old.in_features)
+        target = new.weight.view(patch, patch, channels, old.in_features)
+        source_bias = old.bias.view(patch, patch, old_channels)
+        target_bias = new.bias.view(patch, patch, channels)
+        inherited = []
+        for index, name in enumerate(channel_names):
+            donor = CHANNEL_INHERITANCE.get(name)
+            if donor is None or donor >= old_channels:
+                continue
+            target[:, :, index] = source[:, :, donor]
+            target_bias[:, :, index] = source_bias[:, :, donor]
+            inherited.append(f"{name}<-{donor}")
     decoder.head[0] = new
     decoder.output_channels = channels
+    if verbose:
+        print(f"[kp] head {old_channels}->{channels} channels, inherited "
+              f"{' '.join(inherited) if inherited else '(none)'}", flush=True)
+
+
+@torch.no_grad()
+def calibrate_kp_head(model, loader, device, num_context, n_future,
+                      batches: int = 16) -> float:
+    """Fit the one scalar the inherited head is wrong about: its gain.
+
+    The pre-trained head localises a palm and four fingertips in our frames to
+    within ~20 px straight out of the box, but its maps peak at ~0.03 where the
+    target peaks at 1.0 - it was trained on RoboCasa, and on DexJoCo it is
+    simply unconfident.  Under a squared loss the optimal rescaling is available
+    in closed form, `alpha = <pred, target> / <pred, pred>` over the valid
+    entries, so it is fit once on TRAINING windows before the first step
+    instead of being spent as gradient steps.
+    """
+    model.eval()
+    numerator = denominator = 0.0
+    for index, (frames, actions, _rel, heatmaps, valid_kp, *_rest) in enumerate(loader):
+        if index >= batches:
+            break
+        frames = frames.to(device, non_blocking=True)
+        actions = actions.to(device, non_blocking=True)
+        heatmaps = heatmaps.to(device, non_blocking=True)
+        valid_kp = valid_kp.to(device, non_blocking=True)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            _, _, maps = multistep_predict(model, frames, actions, num_context,
+                                           n_future, with_kp=True)
+        maps = maps.float()
+        mask = valid_kp[..., None, None]
+        numerator += float((maps * heatmaps * mask).sum())
+        denominator += float((maps * maps * mask).sum())
+    model.train()
+    alpha = numerator / max(denominator, 1e-12)
+    head = model.kp_layer.vit_decoder.head[0]
+    head.weight.mul_(alpha)
+    if head.bias is not None:
+        head.bias.mul_(alpha)
+    return alpha
 
 
 def freeze_backbone(model, keep_last: int) -> None:
@@ -327,10 +412,16 @@ def main() -> int:
     parser.add_argument("--kp-weight", type=float, default=100.0,
                         help="upstream train_wm.py weight on the heatmap loss")
     parser.add_argument("--kp-sigma", type=float, default=2.0)
-    parser.add_argument("--kp-head-lr", type=float, default=1e-3,
-                        help="lr for the RE-INITIALISED final patch projection "
-                             "only; the rest of the model (kp_layer trunk "
-                             "included) uses --lr")
+    parser.add_argument("--kp-calibrate-batches", type=int, default=16,
+                        help="training batches used to fit the inherited head's "
+                             "gain in closed form before step 1 (0 disables)")
+    parser.add_argument("--kp-head-lr", type=float, default=3e-4,
+                        help="lr for the WHOLE auxiliary heatmap head "
+                             "(kp_layer: decoder trunk + retargeted patch "
+                             "projection); the predictor itself uses --lr. The "
+                             "head is being repurposed from RoboCasa hand "
+                             "keypoints to our 7 channels, so it has more to "
+                             "learn than the predictor does")
     parser.add_argument("--best-metric", choices=["total", "emb"], default="total",
                         help="which validation number selects best.pth.tar")
     parser.add_argument("--freeze-blocks", type=int, default=0,
@@ -369,13 +460,13 @@ def main() -> int:
     with_kp = args.kp_labels is not None
     if with_kp:
         channels = val_set.kp_channels
-        retarget_kp_head(model, len(channels))
+        retarget_kp_head(model, channels)
         model.forward_kp = kp_forward_last(model)
         if args.freeze_blocks:
             freeze_backbone(model, args.freeze_blocks)
         for parameter in model.kp_layer.parameters():
             parameter.requires_grad_(True)
-        head = list(model.kp_layer.vit_decoder.head[0].parameters())
+        head = [p for p in model.kp_layer.parameters() if p.requires_grad]
         head_ids = {id(parameter) for parameter in head}
         body = [p for p in model.parameters()
                 if p.requires_grad and id(p) not in head_ids]
@@ -445,6 +536,13 @@ def main() -> int:
         else:
             record["val_total"] = record["val_loss"]
         return record
+
+    if with_kp and args.kp_calibrate_batches:
+        gain = calibrate_kp_head(model, train_loader, args.device,
+                                 args.num_context, args.n_future,
+                                 args.kp_calibrate_batches)
+        print(f"[kp] inherited-head gain calibrated to {gain:.3f} on "
+              f"{args.kp_calibrate_batches} training batches", flush=True)
 
     model.train()
     baseline_stats = validate(model, val_loader, args.device, args.num_context,
