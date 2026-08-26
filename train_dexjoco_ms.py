@@ -238,6 +238,47 @@ def kp_forward_last(model):
     return forward_kp
 
 
+def kponly_loss(model, frames, deltas, num_context, n_future, heatmaps,
+                valid_kp, cache_encoder=True, target_latent=False):
+    """Head-only objective: train `kp_layer` on the DETACHED predicted latents.
+
+    This asks the question `dexwm_multistep.md` left open - *is the geometry
+    already in the predicted latent, and only the readout was wrong?* - without
+    letting the auxiliary loss touch the predictor.  Two consequences: the
+    embedding objective cannot degrade (K3 holds by construction), and the
+    rollout itself needs no graph, so it runs under `inference_mode` and the
+    step is several times cheaper than the joint one.
+    """
+    original = model.forward_kp
+    model.forward_kp = lambda *_a, **_k: (None, None)
+    try:
+        with torch.no_grad():
+            predicted, target, _ = multistep_predict(
+                model, frames, deltas, num_context, n_future,
+                cache_encoder=cache_encoder, with_kp=False)
+    finally:
+        model.forward_kp = original
+    per_step = (predicted.float() - target).square().mean(dim=(0, 2, 3))
+    stats = {"emb": per_step.mean().detach(), "emb_per_step": per_step.detach()}
+    # `target_latent` trains the same head on the DINOv2 latents of the frames
+    # that ACTUALLY happen.  It is the control that separates "the head cannot
+    # localise keypoints in a DexWM latent at all" from "the head can, but the
+    # PREDICTED latent does not carry the geometry" - and it produces the oracle
+    # head that `score_kp_rel_disp.py --source oracle` needs.
+    source = (target if target_latent else predicted).detach()
+    maps = model.kp_layer(source, HEATMAP_GRID)
+    squared = (maps.float() - heatmaps).square().mean(dim=(-2, -1))
+    masked = squared * valid_kp
+    kp_loss = masked.mean()
+    fraction = valid_kp.mean().clamp_min(1e-6)
+    stats["kp"] = kp_loss.detach()
+    stats["kp_masked"] = (kp_loss / fraction).detach()
+    stats["kp_per_step"] = (masked.mean(dim=(0, 2))
+                            / valid_kp.mean(dim=(0, 2)).clamp_min(1e-6)).detach()
+    stats["kp_valid"] = fraction.detach()
+    return kp_loss, stats
+
+
 def rollout_windows(frames: torch.Tensor, deltas: torch.Tensor,
                     num_context: int, n_future: int):
     """Padded image stack, padded action stack and the N future deltas.
@@ -312,7 +353,8 @@ def multistep_predict(model, frames: torch.Tensor, deltas: torch.Tensor,
 
 def multistep_loss(model, frames, deltas, num_context, n_future,
                    detach_prev=False, cache_encoder=True,
-                   heatmaps=None, valid_kp=None, kp_weight=0.0):
+                   heatmaps=None, valid_kp=None, kp_weight=0.0,
+                   kp_only=False, kp_target_real=False):
     """Rollout loss.  `emb + kp_weight * kp` when keypoint targets are supplied.
 
     The keypoint term reproduces upstream `train_multistep_wm.py:361-364`: mean
@@ -323,6 +365,9 @@ def multistep_loss(model, frames, deltas, num_context, n_future,
     normalised by the valid fraction, which is the number to compare across runs
     with different label coverage.
     """
+    if kp_only and heatmaps is not None:
+        return kponly_loss(model, frames, deltas, num_context, n_future,
+                           heatmaps, valid_kp, cache_encoder, kp_target_real)
     predicted, target, maps = multistep_predict(
         model, frames, deltas, num_context, n_future, detach_prev, cache_encoder,
         with_kp=heatmaps is not None)
@@ -345,7 +390,8 @@ def multistep_loss(model, frames, deltas, num_context, n_future,
 
 @torch.no_grad()
 def validate(model, loader, device, num_context, n_future, limit=0,
-             cache_encoder=True, kp_weight=0.0, with_kp=False):
+             cache_encoder=True, kp_weight=0.0, with_kp=False,
+             kp_only=False, kp_target_real=False):
     model.eval()
     totals, count = {}, 0
     for index, (frames, actions, _rel, heatmaps, valid_kp, *_rest) in enumerate(loader):
@@ -362,7 +408,8 @@ def validate(model, loader, device, num_context, n_future, limit=0,
             _loss, stats = multistep_loss(
                 model, frames, actions, num_context, n_future,
                 cache_encoder=cache_encoder, heatmaps=heatmaps,
-                valid_kp=valid_kp, kp_weight=kp_weight)
+                valid_kp=valid_kp, kp_weight=kp_weight, kp_only=kp_only,
+                kp_target_real=kp_target_real)
         for key, value in stats.items():
             contribution = value.float().cpu().numpy()
             totals[key] = contribution if key not in totals else totals[key] + contribution
@@ -424,6 +471,16 @@ def main() -> int:
                              "learn than the predictor does")
     parser.add_argument("--best-metric", choices=["total", "emb"], default="total",
                         help="which validation number selects best.pth.tar")
+    parser.add_argument("--kp-only", action="store_true",
+                        help="train ONLY kp_layer, on detached predicted "
+                             "latents: the predictor is frozen, so the "
+                             "embedding objective cannot degrade and the "
+                             "rollout runs without a graph")
+    parser.add_argument("--kp-target-real", action="store_true",
+                        help="with --kp-only, train the head on the DINOv2 "
+                             "latents of the frames that actually happen "
+                             "instead of the predicted ones (head-quality "
+                             "control + the oracle head)")
     parser.add_argument("--freeze-blocks", type=int, default=0,
                         help="forgetting control: keep only the last N CDiT "
                              "blocks (+ final layer + kp head + pos_embed) "
@@ -464,15 +521,19 @@ def main() -> int:
         model.forward_kp = kp_forward_last(model)
         if args.freeze_blocks:
             freeze_backbone(model, args.freeze_blocks)
+        if args.kp_only:
+            for parameter in model.parameters():
+                parameter.requires_grad_(False)
         for parameter in model.kp_layer.parameters():
             parameter.requires_grad_(True)
         head = [p for p in model.kp_layer.parameters() if p.requires_grad]
         head_ids = {id(parameter) for parameter in head}
         body = [p for p in model.parameters()
                 if p.requires_grad and id(p) not in head_ids]
-        groups = [{"params": body, "lr": args.lr},
-                  {"params": head, "lr": args.kp_head_lr}]
-        trainable = body + head
+        groups = ([{"params": head, "lr": args.kp_head_lr}] if args.kp_only
+                  else [{"params": body, "lr": args.lr},
+                        {"params": head, "lr": args.kp_head_lr}])
+        trainable = head if args.kp_only else body + head
         print(f"[kp] channels {channels} weight {args.kp_weight} "
               f"head_lr {args.kp_head_lr} freeze_blocks {args.freeze_blocks}",
               flush=True)
@@ -486,7 +547,8 @@ def main() -> int:
     if args.eval_only:
         stats = validate(model, val_loader, args.device, args.num_context,
                          args.n_future, args.val_batches, args.cache_encoder,
-                         args.kp_weight, with_kp)
+                         args.kp_weight, with_kp, args.kp_only,
+                         args.kp_target_real)
         payload = {"eval_only": True, "tag": args.eval_tag or str(args.resume),
                    "checkpoint": str(args.resume), "n_future": args.n_future,
                    "val_loss": float(stats["emb"]),
@@ -547,7 +609,8 @@ def main() -> int:
     model.train()
     baseline_stats = validate(model, val_loader, args.device, args.num_context,
                               args.n_future, args.val_batches, args.cache_encoder,
-                              args.kp_weight, with_kp)
+                              args.kp_weight, with_kp, args.kp_only,
+                              args.kp_target_real)
     baseline_record = report(baseline_stats)
     baseline = baseline_record["val_loss"]
     baseline_steps = baseline_record["val_loss_per_step"]
@@ -582,7 +645,7 @@ def main() -> int:
                 loss, stats = multistep_loss(
                     model, frames, actions, args.num_context, args.n_future,
                     args.detach_prev, args.cache_encoder, heatmaps, valid_kp,
-                    args.kp_weight)
+                    args.kp_weight, args.kp_only, args.kp_target_real)
             (loss / args.accum).backward()
             micro += 1
             if micro % args.accum:
@@ -621,7 +684,8 @@ def main() -> int:
                 record = report(validate(
                     model, val_loader, args.device, args.num_context,
                     args.n_future, args.val_batches, args.cache_encoder,
-                    args.kp_weight, with_kp))
+                    args.kp_weight, with_kp, args.kp_only,
+                    args.kp_target_real))
                 value = record["val_total" if args.best_metric == "total"
                                else "val_loss"]
                 print(f"[val] step {step} emb {record['val_loss']:.5f} "
@@ -669,6 +733,8 @@ def main() -> int:
          "kp_head_lr": args.kp_head_lr if with_kp else None,
          "best_metric": args.best_metric,
          "freeze_blocks": args.freeze_blocks,
+         "kp_only": args.kp_only,
+         "kp_target_real": args.kp_target_real,
          "baseline": baseline_record,
          "baseline_val_loss": baseline, "baseline_val_loss_per_step": baseline_steps,
          "best_val_loss": best, "steps": step, "total_steps": total_steps,
