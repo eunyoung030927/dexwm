@@ -308,6 +308,7 @@ class DexWM(nn.Module):
         num_heads=16,
         mlp_ratio=2.0,
         num_context=4,
+        n_future=0,
         is_eval=False,
         emb_loss_fn=nn.MSELoss(),
         use_gradient_checkpointing=True,
@@ -367,11 +368,14 @@ class DexWM(nn.Module):
         self.action_dim=action_dim  # num_joints * 3 + 6 (for camera)
         self.action_chunk_encoder = ActionChunkEncoder(
             action_dim=action_dim, hidden_dim=256, max_chunk_len=16)
+        self.n_future = n_future
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.use_fsdp = use_fsdp
 
-        inference_context_size = num_context
-        window_size = num_patches*(inference_context_size + 1)
+        # sequence length: num_context + 1 (single-step) or num_context + n_future (seqext)
+        total_frames = num_context + max(n_future, 1)
+        inference_context_size = total_frames - 1
+        window_size = num_patches * total_frames
 
         if self.is_eval == 1:
             blockwise_spatial_partial = partial(blockwise_spatial_mask_eval, num_frames=inference_context_size + 1, num_tokens=num_patches)
@@ -386,7 +390,7 @@ class DexWM(nn.Module):
         self.blocks = nn.ModuleList([CDiTBlock(hidden_dim, num_heads, self.action_dim, mlp_ratio=mlp_ratio, spatial_mask=spatial_mask, temporal_mask=temporal_mask) for _ in range(depth)])
 
         self.final_layer = FinalLayer(hidden_dim, adain_input_size=self.action_dim)
-        self.pos_embed = nn.Parameter(torch.zeros(self.num_context + 1, self.num_patches, hidden_dim), requires_grad=True)
+        self.pos_embed = nn.Parameter(torch.zeros(total_frames, self.num_patches, hidden_dim), requires_grad=True)
 
 
         self.emb_loss_fn = emb_loss_fn
@@ -518,7 +522,8 @@ class DexWM(nn.Module):
         # CDiT-B / whenever Transformer dimension doesn't match encoder dimension
         if hasattr(self, 'input_proj'):
             x_emb = self.input_proj(x_emb)
-        x_emb = x_emb + self.pos_embed[:self.num_context+1]
+        T_seq = x_emb.shape[1]
+        x_emb = x_emb + self.pos_embed[:T_seq]
 
         x_context = x_emb.clone()
 
@@ -538,12 +543,12 @@ class DexWM(nn.Module):
             # Non-autoregressive: encode full action chunk into one vector,
             # broadcast to all timestep positions.
             c_vec = self.action_chunk_encoder(action_chunk)          # (B, D)
-            c = c_vec.unsqueeze(1).expand(-1, self.num_context + 1, -1)
+            c = c_vec.unsqueeze(1).expand(-1, T_seq, -1)
         else:
             c = self.prepare_actions(actions, action_diff)
             c = torch.cat([torch.zeros_like(c)[:,:1], c], dim=1)  # because x_emb has timesteps [T, T, T+1, ...], therefore, 0th action is 0
 
-        num_cond = self.num_context
+        num_cond = T_seq - 1
         for idx, block in enumerate(self.blocks):
             if self.is_eval or not self.use_gradient_checkpointing or self.use_fsdp:
                 # if FSDP checkpoint block is registered

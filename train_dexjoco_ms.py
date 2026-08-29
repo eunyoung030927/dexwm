@@ -425,10 +425,60 @@ def chunk_loss(model, frames, deltas, num_context, n_future,
     return emb_loss, {"emb": emb_loss.detach()}
 
 
+def seqext_predict(model, frames, deltas, num_context, n_future,
+                   cache_encoder=True):
+    """Non-autoregressive sequence extension: single forward, per-step actions.
+
+    Feeds num_context real frames + n_future copies of the last context frame,
+    with per-step future actions via adaLN.  The model predicts all N future
+    latents in one pass; loss is taken against DINOv2 latents of the actual
+    future frames.
+    """
+    context = frames[:, :num_context]
+    padded_frames = torch.cat(
+        [context, context[:, -1:].expand(-1, n_future, -1, -1, -1)], dim=1)
+
+    future_actions = deltas[:, num_context - 1:num_context - 1 + n_future]
+    zeros = torch.zeros(future_actions.shape[0], num_context - 1,
+                        future_actions.shape[-1],
+                        dtype=future_actions.dtype, device=future_actions.device)
+    padded_actions = torch.cat([zeros, future_actions], dim=1)
+
+    if cache_encoder:
+        all_latents = model.encode_image(frames)
+        target = all_latents[:, num_context:num_context + n_future].float()
+        ctx_latent = all_latents[:, :num_context]
+        padded_latent = torch.cat(
+            [ctx_latent,
+             ctx_latent[:, -1:].expand(-1, n_future, -1, -1)], dim=1)
+        with frozen_encoder(model, padded_latent):
+            pred, _goal, _kp, *_ = model(
+                padded_frames, padded_actions, action_diff=True)
+    else:
+        target = model.encode_image(
+            frames[:, num_context:num_context + n_future]).float()
+        pred, _goal, _kp, *_ = model(
+            padded_frames, padded_actions, action_diff=True)
+
+    predicted = pred[:, num_context:]
+    return predicted, target
+
+
+def seqext_loss(model, frames, deltas, num_context, n_future,
+                cache_encoder=True):
+    """MSE loss for sequence-extension non-autoregressive prediction."""
+    predicted, target = seqext_predict(
+        model, frames, deltas, num_context, n_future, cache_encoder)
+    per_step = (predicted.float() - target).square().mean(dim=(0, 2, 3))
+    emb_loss = per_step.mean()
+    return emb_loss, {"emb": emb_loss.detach(), "emb_per_step": per_step.detach()}
+
+
 @torch.no_grad()
 def validate(model, loader, device, num_context, n_future, limit=0,
              cache_encoder=True, kp_weight=0.0, with_kp=False,
-             kp_only=False, kp_target_real=False, use_chunk=False):
+             kp_only=False, kp_target_real=False, use_chunk=False,
+             use_seqext=False):
     model.eval()
     totals, count = {}, 0
     for index, (frames, actions, _rel, heatmaps, valid_kp, *_rest) in enumerate(loader):
@@ -442,7 +492,11 @@ def validate(model, loader, device, num_context, n_future, limit=0,
         else:
             heatmaps = valid_kp = None
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            if use_chunk:
+            if use_seqext:
+                _loss, stats = seqext_loss(
+                    model, frames, actions, num_context, n_future,
+                    cache_encoder)
+            elif use_chunk:
                 _loss, stats = chunk_loss(
                     model, frames, actions, num_context, n_future,
                     cache_encoder)
@@ -535,6 +589,10 @@ def main() -> int:
                              "and predict s_{t+N} in a single forward pass")
     parser.add_argument("--chunk-encoder-lr", type=float, default=5e-5,
                         help="separate lr for ActionChunkEncoder (new module)")
+    parser.add_argument("--seqext", action="store_true",
+                        help="non-autoregressive sequence extension: extend "
+                             "CDiT input to num_context+n_future frames with "
+                             "per-step action conditioning (DriftWorld-style)")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--no-compile-attention", dest="compile_attention",
                         action="store_false")
@@ -560,13 +618,25 @@ def main() -> int:
         val_set, batch_size=args.batch, shuffle=False, num_workers=args.workers,
         pin_memory=True, drop_last=False, persistent_workers=args.workers > 0)
 
-    model = build_model(args.device, compile_attention=args.compile_attention)
-    load_weights(model, args.resume, strict=not args.chunk)
+    n_future_model = args.n_future if args.seqext else 0
+    model = build_model(args.device, compile_attention=args.compile_attention,
+                        n_future=n_future_model)
+    load_weights(model, args.resume, strict=not (args.chunk or args.seqext))
     for parameter in model.image_embedder.parameters():
         parameter.requires_grad_(False)
 
+    # --- seqext mode: same param groups as multistep, no new modules ---
+    if args.seqext:
+        model.forward_kp = lambda *_a, **_k: (None, torch.zeros((), device=args.device))
+        for p in model.kp_layer.parameters():
+            p.requires_grad_(False)
+        for p in model.action_chunk_encoder.parameters():
+            p.requires_grad_(False)
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        groups = [{"params": trainable, "lr": args.lr}]
+
     # --- chunk mode: separate param groups for CDiT body vs ActionChunkEncoder ---
-    if args.chunk:
+    elif args.chunk:
         model.forward_kp = lambda *_a, **_k: (None, torch.zeros((), device=args.device))
         chunk_params = list(model.action_chunk_encoder.parameters())
         chunk_ids = {id(p) for p in chunk_params}
@@ -614,7 +684,7 @@ def main() -> int:
         stats = validate(model, val_loader, args.device, args.num_context,
                          args.n_future, args.val_batches, args.cache_encoder,
                          args.kp_weight, with_kp, args.kp_only,
-                         args.kp_target_real, use_chunk=args.chunk)
+                         args.kp_target_real, use_chunk=args.chunk, use_seqext=args.seqext)
         payload = {"eval_only": True, "tag": args.eval_tag or str(args.resume),
                    "checkpoint": str(args.resume), "n_future": args.n_future,
                    "val_loss": float(stats["emb"]),
@@ -677,11 +747,11 @@ def main() -> int:
     baseline_stats = validate(model, val_loader, args.device, args.num_context,
                               args.n_future, args.val_batches, args.cache_encoder,
                               args.kp_weight, with_kp, args.kp_only,
-                              args.kp_target_real, use_chunk=args.chunk)
+                              args.kp_target_real, use_chunk=args.chunk, use_seqext=args.seqext)
     baseline_record = report(baseline_stats)
     baseline = baseline_record["val_loss"]
     baseline_steps = baseline_record.get("val_loss_per_step")
-    mode_tag = "chunk" if args.chunk else "multistep"
+    mode_tag = "seqext" if args.seqext else ("chunk" if args.chunk else "multistep")
     step_str = f" per-step {['%.4f' % v for v in baseline_steps]}" if baseline_steps else ""
     print(f"[val] resumed-checkpoint baseline {mode_tag}(N={args.n_future}) "
           f"emb {baseline:.5f}{step_str}"
@@ -711,7 +781,11 @@ def main() -> int:
             else:
                 heatmaps = valid_kp = None
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                if args.chunk:
+                if args.seqext:
+                    loss, stats = seqext_loss(
+                        model, frames, actions, args.num_context, args.n_future,
+                        args.cache_encoder)
+                elif args.chunk:
                     loss, stats = chunk_loss(
                         model, frames, actions, args.num_context, args.n_future,
                         args.cache_encoder)
@@ -763,7 +837,7 @@ def main() -> int:
                     model, val_loader, args.device, args.num_context,
                     args.n_future, args.val_batches, args.cache_encoder,
                     args.kp_weight, with_kp, args.kp_only,
-                    args.kp_target_real, use_chunk=args.chunk))
+                    args.kp_target_real, use_chunk=args.chunk, use_seqext=args.seqext))
                 value = record["val_total" if args.best_metric == "total"
                                else "val_loss"]
                 ps = record.get("val_loss_per_step")

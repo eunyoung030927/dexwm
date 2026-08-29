@@ -45,7 +45,8 @@ def load_dataset_module():
 
 
 def build_model(device, dtype=torch.float32, is_eval=False,
-                gradient_checkpointing=True, compile_attention=True):
+                gradient_checkpointing=True, compile_attention=True,
+                n_future=0):
     original_hub_load = torch.hub.load
 
     def local_dinov2(_repo, model, *args, **kwargs):
@@ -71,7 +72,7 @@ def build_model(device, dtype=torch.float32, is_eval=False,
         model = DexWM(
             backbone_name="dinov2", num_patches=448, patch_size=14,
             hidden_dim=1024, action_dim=132, depth=32, num_heads=16,
-            mlp_ratio=2.0, num_context=8, is_eval=is_eval,
+            mlp_ratio=2.0, num_context=8, n_future=n_future, is_eval=is_eval,
             emb_loss_fn=nn.MSELoss(reduction="mean"),
             use_gradient_checkpointing=gradient_checkpointing,
             use_fsdp=False, num_keypoints=12,
@@ -85,6 +86,15 @@ def load_weights(model, checkpoint: Path, strict=True):
     state = torch.load(checkpoint, map_location="cpu", weights_only=False, mmap=True)
     weights = {key.replace("_orig_mod.", ""): value
                for key, value in state["model"].items()}
+    # Handle pos_embed shape mismatch (seqext extends sequence length)
+    if "pos_embed" in weights and weights["pos_embed"].shape != model.pos_embed.shape:
+        old_pe = weights.pop("pos_embed")
+        T_old = old_pe.shape[0]
+        T_new = model.pos_embed.shape[0]
+        print(f"[load] pos_embed {T_old}→{T_new}: first {T_old} from ckpt, "
+              f"rest initialised", flush=True)
+        with torch.no_grad():
+            model.pos_embed[:T_old].copy_(old_pe)
     missing, unexpected = model.load_state_dict(weights, strict=strict)
     if missing:
         print(f"[load] missing keys (new modules): {missing}", flush=True)
