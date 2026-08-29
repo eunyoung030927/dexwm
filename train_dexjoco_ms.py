@@ -428,7 +428,7 @@ def chunk_loss(model, frames, deltas, num_context, n_future,
 @torch.no_grad()
 def validate(model, loader, device, num_context, n_future, limit=0,
              cache_encoder=True, kp_weight=0.0, with_kp=False,
-             kp_only=False, kp_target_real=False):
+             kp_only=False, kp_target_real=False, use_chunk=False):
     model.eval()
     totals, count = {}, 0
     for index, (frames, actions, _rel, heatmaps, valid_kp, *_rest) in enumerate(loader):
@@ -442,11 +442,16 @@ def validate(model, loader, device, num_context, n_future, limit=0,
         else:
             heatmaps = valid_kp = None
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            _loss, stats = multistep_loss(
-                model, frames, actions, num_context, n_future,
-                cache_encoder=cache_encoder, heatmaps=heatmaps,
-                valid_kp=valid_kp, kp_weight=kp_weight, kp_only=kp_only,
-                kp_target_real=kp_target_real)
+            if use_chunk:
+                _loss, stats = chunk_loss(
+                    model, frames, actions, num_context, n_future,
+                    cache_encoder)
+            else:
+                _loss, stats = multistep_loss(
+                    model, frames, actions, num_context, n_future,
+                    cache_encoder=cache_encoder, heatmaps=heatmaps,
+                    valid_kp=valid_kp, kp_weight=kp_weight, kp_only=kp_only,
+                    kp_target_real=kp_target_real)
         for key, value in stats.items():
             contribution = value.float().cpu().numpy()
             totals[key] = contribution if key not in totals else totals[key] + contribution
@@ -524,6 +529,12 @@ def main() -> int:
                         help="forgetting control: keep only the last N CDiT "
                              "blocks (+ final layer + kp head + pos_embed) "
                              "trainable; 0 trains the whole predictor")
+    parser.add_argument("--chunk", action="store_true",
+                        help="non-autoregressive chunk prediction: encode all "
+                             "N future actions at once via ActionChunkEncoder "
+                             "and predict s_{t+N} in a single forward pass")
+    parser.add_argument("--chunk-encoder-lr", type=float, default=5e-5,
+                        help="separate lr for ActionChunkEncoder (new module)")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--no-compile-attention", dest="compile_attention",
                         action="store_false")
@@ -550,9 +561,24 @@ def main() -> int:
         pin_memory=True, drop_last=False, persistent_workers=args.workers > 0)
 
     model = build_model(args.device, compile_attention=args.compile_attention)
-    load_weights(model, args.resume)
+    load_weights(model, args.resume, strict=not args.chunk)
     for parameter in model.image_embedder.parameters():
         parameter.requires_grad_(False)
+
+    # --- chunk mode: separate param groups for CDiT body vs ActionChunkEncoder ---
+    if args.chunk:
+        model.forward_kp = lambda *_a, **_k: (None, torch.zeros((), device=args.device))
+        chunk_params = list(model.action_chunk_encoder.parameters())
+        chunk_ids = {id(p) for p in chunk_params}
+        for p in model.kp_layer.parameters():
+            p.requires_grad_(False)
+        body_params = [p for p in model.parameters()
+                       if p.requires_grad and id(p) not in chunk_ids]
+        groups = [{"params": body_params, "lr": args.lr},
+                  {"params": chunk_params, "lr": args.chunk_encoder_lr}]
+        trainable = body_params + chunk_params
+        print(f"[chunk] encoder params {sum(p.numel() for p in chunk_params)/1e3:.1f}K "
+              f"| body lr {args.lr} encoder lr {args.chunk_encoder_lr}", flush=True)
 
     with_kp = args.kp_labels is not None
     if with_kp:
@@ -577,7 +603,7 @@ def main() -> int:
         print(f"[kp] channels {channels} weight {args.kp_weight} "
               f"head_lr {args.kp_head_lr} freeze_blocks {args.freeze_blocks}",
               flush=True)
-    else:
+    elif not args.chunk:
         model.forward_kp = lambda *_a, **_k: (None, torch.zeros((), device=args.device))
         for parameter in model.kp_layer.parameters():
             parameter.requires_grad_(False)
@@ -588,7 +614,7 @@ def main() -> int:
         stats = validate(model, val_loader, args.device, args.num_context,
                          args.n_future, args.val_batches, args.cache_encoder,
                          args.kp_weight, with_kp, args.kp_only,
-                         args.kp_target_real)
+                         args.kp_target_real, use_chunk=args.chunk)
         payload = {"eval_only": True, "tag": args.eval_tag or str(args.resume),
                    "checkpoint": str(args.resume), "n_future": args.n_future,
                    "val_loss": float(stats["emb"]),
@@ -627,8 +653,9 @@ def main() -> int:
         final_div_factor=100.0, cycle_momentum=False)
 
     def report(stats):
-        record = {"val_loss": float(stats["emb"]),
-                  "val_loss_per_step": stats["emb_per_step"].tolist()}
+        record = {"val_loss": float(stats["emb"])}
+        if "emb_per_step" in stats:
+            record["val_loss_per_step"] = stats["emb_per_step"].tolist()
         if with_kp:
             record.update({"val_kp_loss": float(stats["kp"]),
                            "val_kp_loss_masked": float(stats["kp_masked"]),
@@ -650,12 +677,14 @@ def main() -> int:
     baseline_stats = validate(model, val_loader, args.device, args.num_context,
                               args.n_future, args.val_batches, args.cache_encoder,
                               args.kp_weight, with_kp, args.kp_only,
-                              args.kp_target_real)
+                              args.kp_target_real, use_chunk=args.chunk)
     baseline_record = report(baseline_stats)
     baseline = baseline_record["val_loss"]
-    baseline_steps = baseline_record["val_loss_per_step"]
-    print(f"[val] resumed-checkpoint baseline multistep(N={args.n_future}) "
-          f"emb {baseline:.5f} per-step {['%.4f' % v for v in baseline_steps]}"
+    baseline_steps = baseline_record.get("val_loss_per_step")
+    mode_tag = "chunk" if args.chunk else "multistep"
+    step_str = f" per-step {['%.4f' % v for v in baseline_steps]}" if baseline_steps else ""
+    print(f"[val] resumed-checkpoint baseline {mode_tag}(N={args.n_future}) "
+          f"emb {baseline:.5f}{step_str}"
           + (f" | kp {baseline_record['val_kp_loss']:.3e} "
              f"masked {baseline_record['val_kp_loss_masked']:.3e}" if with_kp else ""),
           flush=True)
@@ -682,10 +711,15 @@ def main() -> int:
             else:
                 heatmaps = valid_kp = None
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                loss, stats = multistep_loss(
-                    model, frames, actions, args.num_context, args.n_future,
-                    args.detach_prev, args.cache_encoder, heatmaps, valid_kp,
-                    args.kp_weight, args.kp_only, args.kp_target_real)
+                if args.chunk:
+                    loss, stats = chunk_loss(
+                        model, frames, actions, args.num_context, args.n_future,
+                        args.cache_encoder)
+                else:
+                    loss, stats = multistep_loss(
+                        model, frames, actions, args.num_context, args.n_future,
+                        args.detach_prev, args.cache_encoder, heatmaps, valid_kp,
+                        args.kp_weight, args.kp_only, args.kp_target_real)
             (loss / args.accum).backward()
             micro += 1
             if micro % args.accum:
@@ -699,14 +733,18 @@ def main() -> int:
 
             if step % 10 == 0:
                 rate = step / (time.time() - start_time)
-                detail = " ".join(f"{v:.4f}" for v in
-                                  stats["emb_per_step"].float().cpu().numpy())
+                if "emb_per_step" in stats:
+                    detail = " ".join(f"{v:.4f}" for v in
+                                      stats["emb_per_step"].float().cpu().numpy())
+                    detail_str = f" [{detail}]"
+                else:
+                    detail_str = ""
                 extra = (f" kp {float(stats['kp']):.3e} "
                          f"masked {float(stats['kp_masked']):.3e}"
                          if with_kp else "")
                 print(f"[train] epoch {epoch} step {step}/{total_steps} "
                       f"loss {float(loss):.5f} emb {float(stats['emb']):.5f} "
-                      f"[{detail}]{extra} "
+                      f"{detail_str}{extra} "
                       f"lr {scheduler.get_last_lr()[0]:.2e} {rate:.3f} it/s "
                       f"peak {torch.cuda.max_memory_allocated()/2**30:.1f} GiB",
                       flush=True)
@@ -725,12 +763,13 @@ def main() -> int:
                     model, val_loader, args.device, args.num_context,
                     args.n_future, args.val_batches, args.cache_encoder,
                     args.kp_weight, with_kp, args.kp_only,
-                    args.kp_target_real))
+                    args.kp_target_real, use_chunk=args.chunk))
                 value = record["val_total" if args.best_metric == "total"
                                else "val_loss"]
+                ps = record.get("val_loss_per_step")
+                ps_str = f" per-step {['%.4f' % v for v in ps]}" if ps else ""
                 print(f"[val] step {step} emb {record['val_loss']:.5f} "
-                      f"(baseline {baseline:.5f}) per-step "
-                      f"{['%.4f' % v for v in record['val_loss_per_step']]}"
+                      f"(baseline {baseline:.5f}){ps_str}"
                       + (f" | kp {record['val_kp_loss']:.3e} masked "
                          f"{record['val_kp_loss_masked']:.3e} per-step "
                          f"{['%.2e' % v for v in record['val_kp_loss_per_step']]}"

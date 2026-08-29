@@ -81,11 +81,15 @@ def build_model(device, dtype=torch.float32, is_eval=False,
     return model.to(device=device, dtype=dtype)
 
 
-def load_weights(model, checkpoint: Path):
+def load_weights(model, checkpoint: Path, strict=True):
     state = torch.load(checkpoint, map_location="cpu", weights_only=False, mmap=True)
     weights = {key.replace("_orig_mod.", ""): value
                for key, value in state["model"].items()}
-    model.load_state_dict(weights, strict=True)
+    missing, unexpected = model.load_state_dict(weights, strict=strict)
+    if missing:
+        print(f"[load] missing keys (new modules): {missing}", flush=True)
+    if unexpected:
+        print(f"[load] unexpected keys: {unexpected}", flush=True)
     del state, weights
 
 
