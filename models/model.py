@@ -264,6 +264,38 @@ class HeatmapModel(nn.Module):
         x = self.vit_decoder(x, hw_input=hw)
         return x
 
+
+class ActionChunkEncoder(nn.Module):
+    """Encode a variable-length action chunk (B, N, D) into a single
+    conditioning vector (B, D) for non-autoregressive world-model prediction.
+
+    The output projection is zero-initialised so that the encoder acts as a
+    no-op at the start of fine-tuning, preserving pretrained CDiT behaviour.
+    """
+    def __init__(self, action_dim, hidden_dim=256, max_chunk_len=16,
+                 num_layers=2, num_heads=4):
+        super().__init__()
+        self.proj_in = nn.Linear(action_dim, hidden_dim)
+        self.pos_embed = nn.Parameter(
+            torch.randn(1, max_chunk_len, hidden_dim) * 0.02)
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=num_heads,
+            dim_feedforward=hidden_dim * 4, batch_first=True,
+            norm_first=True)
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.proj_out = nn.Linear(hidden_dim, action_dim)
+        # zero-init so chunk encoder starts as no-op
+        nn.init.zeros_(self.proj_out.weight)
+        nn.init.zeros_(self.proj_out.bias)
+
+    def forward(self, actions):
+        """actions: (B, N, action_dim) -> (B, action_dim)"""
+        N = actions.shape[1]
+        x = self.proj_in(actions) + self.pos_embed[:, :N]
+        x = self.encoder(x)
+        return self.proj_out(x.mean(dim=1))
+
+
 class DexWM(nn.Module):
     def __init__(
         self,
@@ -333,6 +365,8 @@ class DexWM(nn.Module):
         self.is_eval = is_eval
         self.num_context = num_context
         self.action_dim=action_dim  # num_joints * 3 + 6 (for camera)
+        self.action_chunk_encoder = ActionChunkEncoder(
+            action_dim=action_dim, hidden_dim=256, max_chunk_len=16)
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.use_fsdp = use_fsdp
 
@@ -458,7 +492,8 @@ class DexWM(nn.Module):
         return kps_heatmap, kp_loss
 
     def forward(self, x, actions=None, rel_t=None, prev_emb=None, action_diff=False,
-                cam_pose=None, gt_kps=None, only_kp=False, valid_kp=None):
+                cam_pose=None, gt_kps=None, only_kp=False, valid_kp=None,
+                action_chunk=None):
         """
         x: (B, context+1, C, H, W)
         goals: (B, C, H, W)
@@ -499,8 +534,14 @@ class DexWM(nn.Module):
         # The prediction at index 0 is excluded from the loss, so x_emb[0] is effectively unused; it is kept
         # only to preserve the existing tensor shapes.
 
-        c = self.prepare_actions(actions, action_diff)
-        c = torch.cat([torch.zeros_like(c)[:,:1], c], dim=1)  # because x_emb has timesteps [T, T, T+1, ...], therefore, 0th action is 0
+        if action_chunk is not None:
+            # Non-autoregressive: encode full action chunk into one vector,
+            # broadcast to all timestep positions.
+            c_vec = self.action_chunk_encoder(action_chunk)          # (B, D)
+            c = c_vec.unsqueeze(1).expand(-1, self.num_context + 1, -1)
+        else:
+            c = self.prepare_actions(actions, action_diff)
+            c = torch.cat([torch.zeros_like(c)[:,:1], c], dim=1)  # because x_emb has timesteps [T, T, T+1, ...], therefore, 0th action is 0
 
         num_cond = self.num_context
         for idx, block in enumerate(self.blocks):

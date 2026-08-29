@@ -388,6 +388,43 @@ def multistep_loss(model, frames, deltas, num_context, n_future,
     return emb_loss + kp_weight * kp_loss, stats
 
 
+def chunk_predict(model, frames, deltas, num_context, n_future,
+                  cache_encoder=True):
+    """Non-autoregressive: s_{1..8} + {a_1..a_N} -> s_{8+N}.  Single forward."""
+    action_chunk = deltas[:, num_context - 1 : num_context - 1 + n_future]
+
+    context = frames[:, :num_context]
+    model_frames = torch.cat([context, context[:, -1:]], dim=1)
+
+    if cache_encoder:
+        latents = model.encode_image(frames)
+        target = latents[:, num_context + n_future - 1 :
+                            num_context + n_future].float()
+        ctx_latent = latents[:, :num_context]
+        window = torch.cat([ctx_latent, ctx_latent[:, -1:]], dim=1)
+        with frozen_encoder(model, window):
+            pred, _goal, pred_kp, *_ = model(
+                model_frames, action_chunk=action_chunk, action_diff=True)
+    else:
+        target = model.encode_image(
+            frames[:, num_context + n_future - 1 :
+                      num_context + n_future]).float()
+        pred, _, pred_kp, *_ = model(
+            model_frames, action_chunk=action_chunk, action_diff=True)
+
+    predicted = pred[:, -1:]
+    return predicted, target
+
+
+def chunk_loss(model, frames, deltas, num_context, n_future,
+               cache_encoder=True):
+    """MSE loss for non-autoregressive chunk prediction."""
+    predicted, target = chunk_predict(
+        model, frames, deltas, num_context, n_future, cache_encoder)
+    emb_loss = (predicted.float() - target).square().mean()
+    return emb_loss, {"emb": emb_loss.detach()}
+
+
 @torch.no_grad()
 def validate(model, loader, device, num_context, n_future, limit=0,
              cache_encoder=True, kp_weight=0.0, with_kp=False,
@@ -431,6 +468,8 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--n-future", type=int, default=3)
     parser.add_argument("--num-context", type=int, default=8)
+    parser.add_argument("--context-stride", type=int, default=5,
+                        help="control steps between DexWM frames; demos=5 (per-control-step files), stride-5 traces=1")
     parser.add_argument("--batch", type=int, default=4)
     parser.add_argument("--accum", type=int, default=1,
                         help="gradient accumulation steps (effective batch = batch*accum)")
@@ -501,7 +540,8 @@ def main() -> int:
 
     common = dict(world_to_camera=world_to_camera, n_future=args.n_future,
                   num_context=args.num_context, seed=args.seed,
-                  kp_root=args.kp_labels, kp_sigma=args.kp_sigma)
+                  kp_root=args.kp_labels, kp_sigma=args.kp_sigma,
+                  context_stride=args.context_stride)
     val_set = demos.DexJoCoDemoDataset(
         args.frames, train=False,
         windows_per_episode=args.val_windows_per_episode, **common)
