@@ -197,9 +197,25 @@ class DexJoCoDemoDataset(Dataset):
                 frames.append(preprocess(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB),
                                          self.img_size, self.patch_size))
             states = store["state"][indices]
-
-        absolute = torch.tensor(np.stack([state_to_action(s) for s in states]),
-                                dtype=torch.float32)
+            # M2 experiment: condition the world model on the COMMANDED hand
+            # motion (recorded controller `action`) instead of the realized
+            # `state`.  DexWM's public action = observed hand-keypoint motion,
+            # so the deployed VLA command is OOD; this switch lets us retrain on
+            # the command.  action[t] drives state[t+1] (corr 0.83 vs 0.79), so
+            # no re-indexing beyond the shared window is needed; the rare
+            # all-zero action row (frame 0 placeholder) falls back to state.
+            if os.environ.get("DEXWM_ACTION_SOURCE", "state") == "action":
+                raw_actions = store["action"][indices]          # (T, 22) absolute command
+                abs_list = []
+                for k, a in enumerate(raw_actions):
+                    a = np.asarray(a, dtype=np.float64)
+                    if np.abs(a).sum() == 0.0:                   # frame-0 placeholder
+                        a = state_to_action(states[k])
+                    abs_list.append(a)
+                absolute = torch.tensor(np.stack(abs_list), dtype=torch.float32)
+            else:
+                absolute = torch.tensor(np.stack([state_to_action(s) for s in states]),
+                                        dtype=torch.float32)
         actions = self._deltas(absolute, world_to_camera=self.world_to_camera)
 
         curr_frames = torch.stack(frames)
