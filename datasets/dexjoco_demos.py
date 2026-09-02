@@ -101,8 +101,16 @@ class DexJoCoDemoDataset(Dataset):
                  num_context=8, patch_size=14, img_size=224, train=True,
                  val_every=10, windows_per_episode=40, seed=0, aug=None,
                  backbone_name="dinov2", context_stride=CONTEXT_STRIDE,
-                 n_future=1, kp_root=None, kp_sigma=2, **_ignored):
+                 n_future=1, kp_root=None, kp_sigma=2, region_uv=False,
+                 **_ignored):
         super().__init__()
+        # region_uv: when True, __getitem__ returns the raw future-frame keypoint
+        # uv (in the 392x224 cropped-image pixel space) + validity + channel names
+        # instead of the (expensive) belief-map heatmaps.  This is the ONLY extra
+        # thing region-weighted latent MSE needs from the label pipeline: it never
+        # trains the heatmap head, it just uses the object/hand uv to weight the
+        # per-patch embedding loss.  Requires kp_root (the same npz labels).
+        self.region_uv = bool(region_uv)
         self.root = Path(root_folder)
         manifest = json.loads((self.root / "manifest.json").read_text())
         episodes = sorted(entry["episode"] for entry in manifest["episodes"])
@@ -224,8 +232,31 @@ class DexJoCoDemoDataset(Dataset):
         metadata = {"episode": episode, "start": start}
         if self.kp_root is None:
             return curr_frames, actions, rel_t, 0, 0, metadata
+        if self.region_uv:
+            uv, valid_uv = self._region_uv(episode, indices[self.num_context:])
+            return curr_frames, actions, rel_t, uv, valid_uv, metadata
         heatmaps, valid_kp = self._belief_maps(episode, indices[self.num_context:])
         return curr_frames, actions, rel_t, heatmaps, valid_kp, metadata
+
+    def _region_uv(self, episode: int, frame_indices):
+        """(N, C, 2) future-frame keypoint uv and (N, C) validity.
+
+        uv is in the same 392x224 cropped-image pixel space as the belief maps
+        (``uv_crop``); missing frames / invalid channels get a zero uv and 0
+        validity.  Used only to build per-patch loss weights, never a heatmap.
+        """
+        label = self.labels[episode]
+        channels = len(self.kp_channels)
+        uv = np.zeros((len(frame_indices), channels, 2), dtype=np.float32)
+        valid = np.zeros((len(frame_indices), channels), dtype=np.float32)
+        for slot, frame in enumerate(frame_indices):
+            position = frame // self.context_stride
+            if position >= label["frame_index"].shape[0] or \
+                    label["frame_index"][position] != frame:
+                continue
+            uv[slot] = label["uv"][position]
+            valid[slot] = label["valid"][position]
+        return torch.from_numpy(uv), torch.from_numpy(valid)
 
     def _belief_maps(self, episode: int, frame_indices):
         """(N, C, 224, 392) belief maps and (N, C) validity for the future frames.

@@ -60,6 +60,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -93,6 +94,82 @@ def frozen_encoder(model, latents: torch.Tensor):
 
 
 HEATMAP_GRID = [16, 28]   # DINOv2 patch grid of the 392x224 crop
+PATCH_ROWS, PATCH_COLS = HEATMAP_GRID   # 16 rows x 28 cols = 448 patches
+
+# Channel groups for region-weighted latent MSE (Method 1).  The DexJoCo label
+# pipeline (scripts/dexwm/label_demo_keypoints.py) emits these 7 channels; the
+# object (can) drives W_obj and the five hand keypoints drive W_hand.  `bucket`
+# is neither, so it is left at weight 1.
+OBJ_CHANNELS = ("object",)
+HAND_CHANNELS = ("index_tip", "middle_tip", "ring_tip", "thumb_tip", "palm")
+
+
+def build_region_weights(uv, valid, channels, w_obj, w_hand, radius,
+                         normalize=True, radius_obj=None, radius_hand=None):
+    """Per-patch loss weights from future-frame keypoint uv.
+
+    uv     (B, N, C, 2)  keypoint pixel coords in the 392x224 cropped space
+    valid  (B, N, C)     1 where the channel is observed, else 0
+    channels             list of channel names (len C)
+
+    Returns (B, N, P) float weights over the P = PATCH_ROWS*PATCH_COLS patch
+    grid: 1 everywhere, W_obj on the +-radius_obj patch box around each valid
+    object keypoint, W_hand on the +-radius_hand box around each valid hand
+    keypoint (max is taken where boxes overlap, and object wins over hand).
+
+    `radius` is the shared fallback radius; `radius_obj` / `radius_hand`
+    override it per channel group so the can can stay tight (small box) while
+    the hand gets a wider box (the hand label is only the palm point, which is
+    occluded behind the can during grasp, so a wider box lets the palm point
+    cover the whole gripper).  When both overrides are None this is byte-for-byte
+    the single-radius behaviour.
+
+    With `normalize`, each (b, n) row is rescaled to mean 1 so the loss scale
+    (and therefore a comparable learning rate) matches the uniform baseline; the
+    relative up-weighting of the can/hand patches is preserved exactly.
+
+    The uv->patch convention (floor(u/14), floor(v/14), clip to grid, +-radius
+    box, flat index row*PATCH_COLS+col) is identical to
+    scripts/dexwm/train_stochastic_latent_predictor.project_patch_mask, so the
+    weighted patches sit on exactly the patches every other DexWM analysis calls
+    the can / hand.
+    """
+    if radius_obj is None:
+        radius_obj = radius
+    if radius_hand is None:
+        radius_hand = radius
+    B, N, C, _ = uv.shape
+    device = uv.device
+    P = PATCH_ROWS * PATCH_COLS
+    weight = torch.ones(B, N, P, dtype=torch.float32, device=device)
+    obj_idx = [i for i, c in enumerate(channels) if c in OBJ_CHANNELS]
+    hand_idx = [i for i, c in enumerate(channels) if c in HAND_CHANNELS]
+
+    def stamp(chan_indices, w, r):
+        for ci in chan_indices:
+            u = uv[:, :, ci, 0]
+            v = uv[:, :, ci, 1]
+            vld = valid[:, :, ci] > 0.5
+            col = torch.clamp((u / 14.0).floor().long(), 0, PATCH_COLS - 1)
+            row = torch.clamp((v / 14.0).floor().long(), 0, PATCH_ROWS - 1)
+            for dr in range(-r, r + 1):
+                for dc in range(-r, r + 1):
+                    rr = torch.clamp(row + dr, 0, PATCH_ROWS - 1)
+                    cc = torch.clamp(col + dc, 0, PATCH_COLS - 1)
+                    flat = rr * PATCH_COLS + cc                 # (B, N)
+                    cur = torch.gather(weight, 2, flat.unsqueeze(-1)).squeeze(-1)
+                    upd = torch.where(vld, torch.clamp_min(cur, w), cur)
+                    weight.scatter_(2, flat.unsqueeze(-1), upd.unsqueeze(-1))
+
+    # hand first, object second so object wins any overlap (clamp_min keeps the
+    # larger, and W_obj >= W_hand in the default config)
+    stamp(hand_idx, w_hand, radius_hand)
+    stamp(obj_idx, w_obj, radius_obj)
+
+    if normalize:
+        mean = weight.mean(dim=2, keepdim=True).clamp_min(1e-6)
+        weight = weight / mean
+    return weight
 
 
 # The public checkpoint's 12 heatmap channels are, in order,
@@ -351,10 +428,25 @@ def multistep_predict(model, frames: torch.Tensor, deltas: torch.Tensor,
     return torch.cat(predictions, dim=1), target, maps
 
 
+def _weighted_per_step(predicted, target, patch_weight):
+    """Region-weighted per-step latent MSE.
+
+    predicted/target (B, N, P, D); patch_weight (B, N, P).  Per-patch MSE over
+    the D feature dim, then a patch_weight-weighted mean over the P patches, then
+    the plain mean over the batch -> (N,).  With `patch_weight` normalised to
+    mean 1 per (b, n) this stays on the same scale as the uniform baseline.
+    """
+    per_patch = (predicted.float() - target).square().mean(dim=3)   # (B, N, P)
+    w = patch_weight.to(per_patch.dtype)
+    denom = w.sum(dim=2).clamp_min(1e-6)                             # (B, N)
+    weighted = (per_patch * w).sum(dim=2) / denom                   # (B, N)
+    return weighted.mean(dim=0)                                     # (N,)
+
+
 def multistep_loss(model, frames, deltas, num_context, n_future,
                    detach_prev=False, cache_encoder=True,
                    heatmaps=None, valid_kp=None, kp_weight=0.0,
-                   kp_only=False, kp_target_real=False):
+                   kp_only=False, kp_target_real=False, patch_weight=None):
     """Rollout loss.  `emb + kp_weight * kp` when keypoint targets are supplied.
 
     The keypoint term reproduces upstream `train_multistep_wm.py:361-364`: mean
@@ -371,9 +463,18 @@ def multistep_loss(model, frames, deltas, num_context, n_future,
     predicted, target, maps = multistep_predict(
         model, frames, deltas, num_context, n_future, detach_prev, cache_encoder,
         with_kp=heatmaps is not None)
+    # Uniform baseline is byte-identical when patch_weight is None.
     per_step = (predicted.float() - target).square().mean(dim=(0, 2, 3))
     emb_loss = per_step.mean()
     stats = {"emb": emb_loss.detach(), "emb_per_step": per_step.detach()}
+    if patch_weight is not None:
+        # region-weighted objective drives the gradient; the uniform per_step
+        # above is retained only as a comparable diagnostic ("emb").
+        w_per_step = _weighted_per_step(predicted, target, patch_weight)
+        stats["emb_weighted"] = w_per_step.mean().detach()
+        stats["emb_weighted_per_step"] = w_per_step.detach()
+        if heatmaps is None:
+            return w_per_step.mean(), stats
     if heatmaps is None:
         return emb_loss, stats
     squared = (maps.float() - heatmaps).square().mean(dim=(-2, -1))   # (B, N, C)
@@ -478,7 +579,7 @@ def seqext_loss(model, frames, deltas, num_context, n_future,
 def validate(model, loader, device, num_context, n_future, limit=0,
              cache_encoder=True, kp_weight=0.0, with_kp=False,
              kp_only=False, kp_target_real=False, use_chunk=False,
-             use_seqext=False):
+             use_seqext=False, region_cfg=None):
     model.eval()
     totals, count = {}, 0
     for index, (frames, actions, _rel, heatmaps, valid_kp, *_rest) in enumerate(loader):
@@ -486,7 +587,18 @@ def validate(model, loader, device, num_context, n_future, limit=0,
             break
         frames = frames.to(device, non_blocking=True)
         actions = actions.to(device, non_blocking=True)
-        if with_kp:
+        patch_weight = None
+        if region_cfg is not None:
+            uv = heatmaps.to(device, non_blocking=True)
+            valid_uv = valid_kp.to(device, non_blocking=True)
+            patch_weight = build_region_weights(
+                uv, valid_uv, region_cfg["channels"], region_cfg["w_obj"],
+                region_cfg["w_hand"], region_cfg["radius"],
+                region_cfg["normalize"],
+                radius_obj=region_cfg.get("radius_obj"),
+                radius_hand=region_cfg.get("radius_hand"))
+            heatmaps = valid_kp = None
+        elif with_kp:
             heatmaps = heatmaps.to(device, non_blocking=True)
             valid_kp = valid_kp.to(device, non_blocking=True)
         else:
@@ -505,7 +617,7 @@ def validate(model, loader, device, num_context, n_future, limit=0,
                     model, frames, actions, num_context, n_future,
                     cache_encoder=cache_encoder, heatmaps=heatmaps,
                     valid_kp=valid_kp, kp_weight=kp_weight, kp_only=kp_only,
-                    kp_target_real=kp_target_real)
+                    kp_target_real=kp_target_real, patch_weight=patch_weight)
         for key, value in stats.items():
             contribution = value.float().cpu().numpy()
             totals[key] = contribution if key not in totals else totals[key] + contribution
@@ -557,6 +669,41 @@ def main() -> int:
     parser.add_argument("--kp-weight", type=float, default=100.0,
                         help="upstream train_wm.py weight on the heatmap loss")
     parser.add_argument("--kp-sigma", type=float, default=2.0)
+    # --- Method 1: region-weighted latent MSE ------------------------------
+    parser.add_argument("--region-weight", action="store_true",
+                        help="weight the per-patch latent MSE so can + hand "
+                             "patches stop being averaged away (Method 1). "
+                             "OFF => byte-identical to the uniform emb_loss. "
+                             "Requires --region-labels (the same npz keypoints "
+                             "as --kp-labels); does NOT train the heatmap head.")
+    parser.add_argument("--region-labels", type=Path, default=None,
+                        help="directory of per-episode 2-D keypoint labels used "
+                             "to place the region weights (defaults to "
+                             "--kp-labels when that is set)")
+    parser.add_argument("--w-obj", type=float, default=5.0,
+                        help="weight on patches near the object (can) keypoint")
+    parser.add_argument("--w-hand", type=float, default=3.0,
+                        help="weight on patches near the hand/fingertip keypoints")
+    parser.add_argument("--kp-radius", type=int, default=2,
+                        help="patch radius of the up-weighted box around each "
+                             "projected keypoint (a value of r stamps a "
+                             "(2r+1)x(2r+1) box); shared fallback for both "
+                             "groups when --kp-radius-obj/-hand are unset")
+    parser.add_argument("--kp-radius-obj", type=int, default=None,
+                        help="override --kp-radius for the object (can) box "
+                             "only; keeps the can tight while the hand box can "
+                             "be wider (defaults to --kp-radius)")
+    parser.add_argument("--kp-radius-hand", type=int, default=None,
+                        help="override --kp-radius for the hand/fingertip box "
+                             "only; the hand label is just the palm point "
+                             "(occluded behind the can during grasp) so a wider "
+                             "radius lets it cover the gripper (defaults to "
+                             "--kp-radius)")
+    parser.add_argument("--region-no-normalize", dest="region_normalize",
+                        action="store_false",
+                        help="keep the weights unnormalised (mean > 1); default "
+                             "normalises each frame's weights to mean 1 so the "
+                             "loss scale and LR match the uniform baseline")
     parser.add_argument("--kp-calibrate-batches", type=int, default=16,
                         help="training batches used to fit the inherited head's "
                              "gain in closed form before step 1 (0 disables)")
@@ -598,6 +745,12 @@ def main() -> int:
                         action="store_false")
     args = parser.parse_args()
 
+    # per-channel region radii default to the shared --kp-radius
+    if args.kp_radius_obj is None:
+        args.kp_radius_obj = args.kp_radius
+    if args.kp_radius_hand is None:
+        args.kp_radius_hand = args.kp_radius
+
     args.out.mkdir(parents=True, exist_ok=True)
     log_path = args.out / "curve.jsonl"
     torch.manual_seed(args.seed)
@@ -607,9 +760,25 @@ def main() -> int:
     with np.load(args.world_to_camera, allow_pickle=False) as reference:
         world_to_camera = np.asarray(reference["world_to_camera"])
 
+    if args.region_weight:
+        region_labels = args.region_labels or args.kp_labels
+        if region_labels is None:
+            parser.error("--region-weight requires --region-labels (or --kp-labels)")
+        if args.kp_labels is not None:
+            parser.error("--region-weight and --kp-labels are mutually exclusive "
+                         "(the region objective uses the keypoint uv to weight "
+                         "the latent MSE, it does not train the heatmap head)")
+        # region mode loads the same labels but returns raw uv, not heatmaps
+        kp_root_for_common = region_labels
+        region_uv = True
+    else:
+        kp_root_for_common = args.kp_labels
+        region_uv = False
+
     common = dict(world_to_camera=world_to_camera, n_future=args.n_future,
                   num_context=args.num_context, seed=args.seed,
-                  kp_root=args.kp_labels, kp_sigma=args.kp_sigma,
+                  kp_root=kp_root_for_common, kp_sigma=args.kp_sigma,
+                  region_uv=region_uv,
                   context_stride=args.context_stride)
     val_set = demos.DexJoCoDemoDataset(
         args.frames, train=False,
@@ -618,10 +787,39 @@ def main() -> int:
         val_set, batch_size=args.batch, shuffle=False, num_workers=args.workers,
         pin_memory=True, drop_last=False, persistent_workers=args.workers > 0)
 
+    region_channels = val_set.kp_channels if args.region_weight else None
+    region_cfg = None
+    if args.region_weight:
+        n_obj = sum(c in OBJ_CHANNELS for c in region_channels)
+        n_hand = sum(c in HAND_CHANNELS for c in region_channels)
+        print(f"[region] channels {region_channels} | obj={n_obj} hand={n_hand} "
+              f"| w_obj {args.w_obj} w_hand {args.w_hand} "
+              f"radius_obj {args.kp_radius_obj} radius_hand {args.kp_radius_hand} "
+              f"| normalize {args.region_normalize}", flush=True)
+        region_cfg = dict(channels=region_channels, w_obj=args.w_obj,
+                          w_hand=args.w_hand, radius=args.kp_radius,
+                          radius_obj=args.kp_radius_obj,
+                          radius_hand=args.kp_radius_hand,
+                          normalize=args.region_normalize)
+
     n_future_model = args.n_future if args.seqext else 0
     model = build_model(args.device, compile_attention=args.compile_attention,
                         n_future=n_future_model)
-    load_weights(model, args.resume, strict=not (args.chunk or args.seqext))
+    # DexWM.__init__ now always builds an (unused-here) ActionChunkEncoder, but
+    # pre-chunk checkpoints (e.g. the multi/ multistep phase we curriculum-resume
+    # from) don't carry its weights.  When the ckpt lacks that module, load
+    # non-strict; every other key must still match exactly.
+    strict_load = not (args.chunk or args.seqext)
+    if strict_load:
+        _ckpt_keys = torch.load(args.resume, map_location="cpu",
+                                weights_only=False, mmap=True)["model"].keys()
+        if not any("action_chunk_encoder" in k for k in _ckpt_keys):
+            strict_load = False
+            print("[load] resume ckpt has no action_chunk_encoder; loading "
+                  "non-strict (only that unused module may be missing)",
+                  flush=True)
+        del _ckpt_keys
+    load_weights(model, args.resume, strict=strict_load)
     for parameter in model.image_embedder.parameters():
         parameter.requires_grad_(False)
 
@@ -684,7 +882,8 @@ def main() -> int:
         stats = validate(model, val_loader, args.device, args.num_context,
                          args.n_future, args.val_batches, args.cache_encoder,
                          args.kp_weight, with_kp, args.kp_only,
-                         args.kp_target_real, use_chunk=args.chunk, use_seqext=args.seqext)
+                         args.kp_target_real, use_chunk=args.chunk, use_seqext=args.seqext,
+                         region_cfg=region_cfg)
         payload = {"eval_only": True, "tag": args.eval_tag or str(args.resume),
                    "checkpoint": str(args.resume), "n_future": args.n_future,
                    "val_loss": float(stats["emb"]),
@@ -726,12 +925,22 @@ def main() -> int:
         record = {"val_loss": float(stats["emb"])}
         if "emb_per_step" in stats:
             record["val_loss_per_step"] = stats["emb_per_step"].tolist()
+        if "emb_weighted" in stats:
+            # region-weighted objective: `val_loss` stays the uniform emb so it is
+            # directly comparable to the baseline, but best.pth.tar is selected on
+            # the weighted loss (the objective actually optimised).
+            record["val_loss_weighted"] = float(stats["emb_weighted"])
+            if "emb_weighted_per_step" in stats:
+                record["val_loss_weighted_per_step"] = \
+                    stats["emb_weighted_per_step"].tolist()
         if with_kp:
             record.update({"val_kp_loss": float(stats["kp"]),
                            "val_kp_loss_masked": float(stats["kp_masked"]),
                            "val_kp_loss_per_step": stats["kp_per_step"].tolist(),
                            "val_kp_valid_fraction": float(stats["kp_valid"])})
             record["val_total"] = record["val_loss"] + args.kp_weight * record["val_kp_loss"]
+        elif "val_loss_weighted" in record:
+            record["val_total"] = record["val_loss_weighted"]
         else:
             record["val_total"] = record["val_loss"]
         return record
@@ -747,14 +956,17 @@ def main() -> int:
     baseline_stats = validate(model, val_loader, args.device, args.num_context,
                               args.n_future, args.val_batches, args.cache_encoder,
                               args.kp_weight, with_kp, args.kp_only,
-                              args.kp_target_real, use_chunk=args.chunk, use_seqext=args.seqext)
+                              args.kp_target_real, use_chunk=args.chunk, use_seqext=args.seqext,
+                         region_cfg=region_cfg)
     baseline_record = report(baseline_stats)
     baseline = baseline_record["val_loss"]
     baseline_steps = baseline_record.get("val_loss_per_step")
     mode_tag = "seqext" if args.seqext else ("chunk" if args.chunk else "multistep")
     step_str = f" per-step {['%.4f' % v for v in baseline_steps]}" if baseline_steps else ""
+    baseline_embw = (f" embW {baseline_record['val_loss_weighted']:.5f}"
+                     if "val_loss_weighted" in baseline_record else "")
     print(f"[val] resumed-checkpoint baseline {mode_tag}(N={args.n_future}) "
-          f"emb {baseline:.5f}{step_str}"
+          f"emb {baseline:.5f}{step_str}{baseline_embw}"
           + (f" | kp {baseline_record['val_kp_loss']:.3e} "
              f"masked {baseline_record['val_kp_loss_masked']:.3e}" if with_kp else ""),
           flush=True)
@@ -775,7 +987,32 @@ def main() -> int:
         for frames, actions, _rel, heatmaps, valid_kp, *_rest in train_loader:
             frames = frames.to(args.device, non_blocking=True)
             actions = actions.to(args.device, non_blocking=True)
-            if with_kp:
+            patch_weight = None
+            if args.region_weight:
+                uv = heatmaps.to(args.device, non_blocking=True)        # (B,N,C,2)
+                valid_uv = valid_kp.to(args.device, non_blocking=True)  # (B,N,C)
+                patch_weight = build_region_weights(
+                    uv, valid_uv, region_channels, args.w_obj, args.w_hand,
+                    args.kp_radius, args.region_normalize,
+                    radius_obj=args.kp_radius_obj,
+                    radius_hand=args.kp_radius_hand)
+                if os.environ.get("REGION_WEIGHT_DEBUG") and step < 3:
+                    # sanity: how many patches carry the up-weight (should be a
+                    # handful per keypoint) and that the mean is ~1 (normalised)
+                    raw = build_region_weights(
+                        uv, valid_uv, region_channels, args.w_obj, args.w_hand,
+                        args.kp_radius, normalize=False,
+                        radius_obj=args.kp_radius_obj,
+                        radius_hand=args.kp_radius_hand)
+                    n_obj = int((raw[0, 0] == args.w_obj).sum())
+                    n_hand = int((raw[0, 0] == args.w_hand).sum())
+                    print(f"[region-dbg] step {step} b0f0: obj_patches {n_obj} "
+                          f"hand_patches {n_hand} | norm mean "
+                          f"{float(patch_weight[0,0].mean()):.4f} max "
+                          f"{float(patch_weight[0,0].max()):.3f} min "
+                          f"{float(patch_weight[0,0].min()):.3f}", flush=True)
+                heatmaps = valid_kp = None
+            elif with_kp:
                 heatmaps = heatmaps.to(args.device, non_blocking=True)
                 valid_kp = valid_kp.to(args.device, non_blocking=True)
             else:
@@ -793,7 +1030,8 @@ def main() -> int:
                     loss, stats = multistep_loss(
                         model, frames, actions, args.num_context, args.n_future,
                         args.detach_prev, args.cache_encoder, heatmaps, valid_kp,
-                        args.kp_weight, args.kp_only, args.kp_target_real)
+                        args.kp_weight, args.kp_only, args.kp_target_real,
+                        patch_weight=patch_weight)
             (loss / args.accum).backward()
             micro += 1
             if micro % args.accum:
@@ -816,6 +1054,8 @@ def main() -> int:
                 extra = (f" kp {float(stats['kp']):.3e} "
                          f"masked {float(stats['kp_masked']):.3e}"
                          if with_kp else "")
+                if "emb_weighted" in stats:
+                    extra += f" embW {float(stats['emb_weighted']):.5f}"
                 print(f"[train] epoch {epoch} step {step}/{total_steps} "
                       f"loss {float(loss):.5f} emb {float(stats['emb']):.5f} "
                       f"{detail_str}{extra} "
@@ -837,13 +1077,16 @@ def main() -> int:
                     model, val_loader, args.device, args.num_context,
                     args.n_future, args.val_batches, args.cache_encoder,
                     args.kp_weight, with_kp, args.kp_only,
-                    args.kp_target_real, use_chunk=args.chunk, use_seqext=args.seqext))
+                    args.kp_target_real, use_chunk=args.chunk, use_seqext=args.seqext,
+                         region_cfg=region_cfg))
                 value = record["val_total" if args.best_metric == "total"
                                else "val_loss"]
                 ps = record.get("val_loss_per_step")
                 ps_str = f" per-step {['%.4f' % v for v in ps]}" if ps else ""
+                embw_str = (f" embW {record['val_loss_weighted']:.5f}"
+                            if "val_loss_weighted" in record else "")
                 print(f"[val] step {step} emb {record['val_loss']:.5f} "
-                      f"(baseline {baseline:.5f}){ps_str}"
+                      f"(baseline {baseline:.5f}){ps_str}{embw_str}"
                       + (f" | kp {record['val_kp_loss']:.3e} masked "
                          f"{record['val_kp_loss_masked']:.3e} per-step "
                          f"{['%.2e' % v for v in record['val_kp_loss_per_step']]}"
