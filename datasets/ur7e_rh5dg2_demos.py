@@ -152,6 +152,22 @@ def _decode_window(video: Path, from_ts: float, frame_indices, fps: float):
     return [out[k] for k in wanted]
 
 
+def _load_cached(frames_root: Path, episode: int, frame_indices):
+    """Read pre-decoded RGB frames from the export cache (JPEG npz)."""
+    import cv2
+
+    path = frames_root / f"episode_{episode:03d}.npz"
+    with np.load(path, allow_pickle=False) as store:
+        out = []
+        for i in frame_indices:
+            buf = store[f"frame_{i:05d}"]
+            bgr = cv2.imdecode(np.asarray(buf, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if bgr is None:
+                raise ValueError(f"episode {episode} frame {i}: cached JPEG decode failed")
+            out.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+    return out
+
+
 # --------------------------------------------------------------------------
 # Dataset
 # --------------------------------------------------------------------------
@@ -165,9 +181,15 @@ class UR7eRH5DG2DemoDataset(Dataset):
                  patch_size=14, img_size=224, train=True, val_every=10,
                  windows_per_episode=40, seed=0, context_stride=CONTEXT_STRIDE,
                  n_future=1, default_active=None, default_full=None,
-                 hand_scale=1.0, rot6d_layout="columns", **_ignored):
+                 hand_scale=1.0, rot6d_layout="columns", frames_root=None,
+                 **_ignored):
         super().__init__()
         self.root = Path(root_folder)
+        # Optional pre-decoded frame cache (export_ur7e_frames.py).  When set,
+        # frames come from JPEG npz instead of on-the-fly av1 mp4 decode, which
+        # is the difference between a fast training run and a decode-bound one.
+        # state/action/lengths still come from root_folder's parquet (small).
+        self.frames_root = Path(frames_root) if frames_root else None
         self.info, episodes = _read_meta(self.root)
         self.fps = float(self.info.get("fps", 50))
         self.states, self.actions = _read_columns(self.root)
@@ -206,6 +228,7 @@ class UR7eRH5DG2DemoDataset(Dataset):
         self.usable = [e for e in self.episodes if e["length"] - 1 - self.span > 0]
         if not self.usable:
             raise RuntimeError("no episode long enough for the requested window span")
+        self.n_windows_total = sum(e["length"] - self.span for e in self.usable)
 
     def __len__(self):
         return len(self.usable) * self.windows_per_episode
@@ -225,9 +248,12 @@ class UR7eRH5DG2DemoDataset(Dataset):
         frame_ids = [start + k * self.context_stride
                      for k in range(self.num_context + self.n_future)]
 
-        rgb = _decode_window(
-            _video_path(self.root, self.info, ep["video_chunk"], ep["video_file"]),
-            ep["video_from_ts"], frame_ids, self.fps)
+        if self.frames_root is not None:
+            rgb = _load_cached(self.frames_root, ep["episode_index"], frame_ids)
+        else:
+            rgb = _decode_window(
+                _video_path(self.root, self.info, ep["video_chunk"], ep["video_file"]),
+                ep["video_from_ts"], frame_ids, self.fps)
         frames = torch.stack([preprocess(f, self.img_size, self.patch_size) for f in rgb])
 
         rows = [ep["from"] + f for f in frame_ids]

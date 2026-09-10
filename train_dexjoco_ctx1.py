@@ -86,6 +86,17 @@ from train_dexjoco_ft import load_dataset_module  # noqa: E402
 from train_dexjoco_ms import retarget_kp_head  # noqa: E402
 
 
+def load_ur7e_dataset_module():
+    """UR7E+RH5DG2 loader (DynaGuide comparison), loaded like load_dataset_module."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "ur7e_rh5dg2_demos", REPO / "datasets" / "ur7e_rh5dg2_demos.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _env_path(name: str):
     value = os.environ.get(name)
     return Path(value) if value else None
@@ -327,6 +338,24 @@ def build_parser() -> argparse.ArgumentParser:
                              "the summary (build_model resolves it itself). "
                              "Env: DINOV2_HUB_DIR")
 
+    # --- embodiment / dataset selection (DynaGuide comparison) --------------
+    parser.add_argument("--dataset", choices=["dexjoco", "ur7e"], default="dexjoco",
+                        help="dexjoco = Franka+Allegro DexJoCo frames (default); "
+                             "ur7e = UR7E+RH5DG2 abs_ee LeRobot (DexSteer/"
+                             "isaaclab_ur7e_3task_fixed). Picks the loader + "
+                             "action adapter only; model/loss/checkpoint identical.")
+    parser.add_argument("--frames-root", type=Path, default=_env_path("DEXWM_FRAMES_ROOT"),
+                        help="ur7e only: pre-decoded JPEG frame cache "
+                             "(export_ur7e_frames.py). Omit to decode av1 mp4 on "
+                             "the fly (slow). Env: DEXWM_FRAMES_ROOT")
+    parser.add_argument("--defaults-npz", type=Path, default=_env_path("DEXWM_RH5DG2_DEFAULTS"),
+                        help="ur7e only: npz with default_active(13)/default_full(18) "
+                             "for RH5DG2 (parse_rh5dg2_urdf.py). Env: DEXWM_RH5DG2_DEFAULTS")
+    parser.add_argument("--hand-scale", type=float, default=1.0,
+                        help="ur7e only: abs_ee hand-offset scale (env hand_scale)")
+    parser.add_argument("--rot6d-layout", choices=["columns", "rows"], default="columns",
+                        help="ur7e only: rot6d->matrix layout (env default columns)")
+
     # --- the point of this script -------------------------------------------
     parser.add_argument("--num-context", type=int, default=1,
                         help="context frames the predictor conditions on "
@@ -402,7 +431,11 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    for name in ("task_data_root", "world_to_camera", "out_dir"):
+    required = ["task_data_root", "out_dir"]
+    if args.dataset == "dexjoco":
+        # ur7e's external-camera extrinsic is optional (None -> root frame).
+        required.append("world_to_camera")
+    for name in required:
         if getattr(args, name) is None:
             parser.error(f"--{name.replace('_', '-')} is required "
                          f"(or set its env var)")
@@ -421,20 +454,39 @@ def main() -> int:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    demos = load_dataset_module()
-    with np.load(args.world_to_camera, allow_pickle=False) as reference:
-        world_to_camera = np.asarray(reference["world_to_camera"])
-
     with_kp = args.kp_labels is not None
-    common = dict(world_to_camera=world_to_camera,
-                  num_context=args.num_context, n_future=1,
-                  context_stride=args.context_stride, val_every=args.val_every,
-                  seed=args.seed, kp_root=args.kp_labels,
-                  kp_sigma=args.kp_sigma)
-    train_set = demos.DexJoCoDemoDataset(
+    if args.dataset == "ur7e":
+        ur7e = load_ur7e_dataset_module()
+        world_to_camera = None
+        if args.world_to_camera is not None:
+            with np.load(args.world_to_camera, allow_pickle=False) as reference:
+                world_to_camera = np.asarray(reference["world_to_camera"])
+        default_active = default_full = None
+        if args.defaults_npz is not None:
+            with np.load(args.defaults_npz, allow_pickle=False) as d:
+                default_active = np.asarray(d["default_active"], dtype=np.float32)
+                default_full = np.asarray(d["default_full"], dtype=np.float32)
+        common = dict(world_to_camera=world_to_camera,
+                      num_context=args.num_context, n_future=1,
+                      context_stride=args.context_stride, val_every=args.val_every,
+                      seed=args.seed, frames_root=args.frames_root,
+                      default_active=default_active, default_full=default_full,
+                      hand_scale=args.hand_scale, rot6d_layout=args.rot6d_layout)
+        Dataset = ur7e.UR7eRH5DG2DemoDataset
+    else:
+        demos = load_dataset_module()
+        with np.load(args.world_to_camera, allow_pickle=False) as reference:
+            world_to_camera = np.asarray(reference["world_to_camera"])
+        common = dict(world_to_camera=world_to_camera,
+                      num_context=args.num_context, n_future=1,
+                      context_stride=args.context_stride, val_every=args.val_every,
+                      seed=args.seed, kp_root=args.kp_labels,
+                      kp_sigma=args.kp_sigma)
+        Dataset = demos.DexJoCoDemoDataset
+    train_set = Dataset(
         args.task_data_root, train=True,
         windows_per_episode=args.windows_per_episode, **common)
-    val_set = demos.DexJoCoDemoDataset(
+    val_set = Dataset(
         args.task_data_root, train=False,
         windows_per_episode=args.val_windows_per_episode, **common)
     print(f"[data] task {args.task} num_context {args.num_context} "
